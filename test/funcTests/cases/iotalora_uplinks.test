@@ -1,0 +1,321 @@
+#
+# FILE            iotalora_uplinks.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# LoRaWAN uplinks as DataChannel records, written attributes as downlinks - two network servers on one private
+# mosquitto, netserver.py playing both:
+#
+#   ttn/farm@ttn                 TTN v3, Cayenne LPP (the default): temperature_1, relative_humidity_2,
+#                                gps_3 (flat: gps_3.latitude ...) as a point, digital_out_4 and analog_out_5 -
+#                                both, so a write is an LPP downlink
+#   ttn/decoded@ttn              TTN v3, application_server (decoded_payload), fPort 2 - both: the downlink's
+#                                decoded_payload, the values made whole again
+#   cs/app-1                     ChirpStack v4, CBOR; @deviceName as an attribute; its time the uplink's
+#   cs/app-2/0004a30b001c0001    ChirpStack v4, one device, LPP - both: command/down with the DevEUI
+#
+# A frame with an LPP type that is not known is dropped whole; a write to what LPP cannot carry (a sensor's
+# value) is refused - 400, nothing stored, no downlink.
+#
+--NAME--
+iotalora - TTN and ChirpStack uplinks (Cayenne LPP, CBOR, decoded) as DataChannel records, writes as downlinks
+
+--TAGS--
+iotalora
+
+--INIT--
+rm -rf "${IOTALORA_TEST_DIR:?}"
+mkdir -p "$IOTALORA_TEST_DIR"
+printf 'listener 11886\nallow_anonymous true\n' > "$IOTALORA_TEST_DIR/mosquitto.conf"
+nohup mosquitto -c "$IOTALORA_TEST_DIR/mosquitto.conf" > "$IOTALORA_TEST_DIR/mosquitto.log" 2>&1 &
+echo $! > "$IOTALORA_TEST_DIR/mosquitto.pid"
+for i in $(seq 1 50); do (echo > /dev/tcp/localhost/11886) 2>/dev/null && break; sleep 0.1; done
+nohup python3 "$REPO_ROOT/test/funcTests/netserver.py" listen 11886 "$IOTALORA_TEST_DIR/downlinks.log" > "$IOTALORA_TEST_DIR/listen.out" 2>&1 &
+echo $! > "$IOTALORA_TEST_DIR/listen.pid"
+for i in $(seq 1 50); do grep -q READY "$IOTALORA_TEST_DIR/downlinks.log" 2>/dev/null && break; sleep 0.1; done
+cat > "$IOTALORA_TEST_DIR/bridges.json" <<EOF
+{
+  "iotalora": {
+    "servers": {
+      "ttn": { "kind": "ttn",        "uri": "mqtt://localhost:11886" },
+      "cs":  { "kind": "chirpstack", "uri": "mqtt://localhost:11886" }
+    },
+    "ngsild": {
+      "defaultEntity": false,
+      "dataChannels": {
+        "ttn/farm@ttn": { "channelDirection": "both", "idEncoding": "percent",
+                          "entities": [ { "type": "Sensor", "id": "urn:ngsi-ld:Sensor:{@deviceId}",
+                                          "attributes": { "temperature": { "column": "temperature_1" },
+                                                          "humidity":    { "column": "relative_humidity_2" },
+                                                          "location":    { "point": { "latitude": "gps_3.latitude", "longitude": "gps_3.longitude" } },
+                                                          "relay":       { "column": "digital_out_4" },
+                                                          "level":       { "column": "analog_out_5" } } } ] },
+        "ttn/decoded@ttn": { "channelDirection": "both", "idEncoding": "percent",
+                             "channelInfo": [ { "key": "dataModel", "value": "application_server" }, { "key": "fPort", "value": "2" } ],
+                             "entities": [ { "type": "Valve", "id": "urn:ngsi-ld:Valve:{@deviceId}",
+                                             "attributes": { "open": { "column": "valve.open", "as": "boolean" },
+                                                             "flow": { "column": "flow" } } } ] },
+        "cs/app-1": { "channelInfo": [ { "key": "dataModel", "value": "cbor" } ],
+                      "entities": [ { "type": "Meter", "id": "urn:ngsi-ld:Meter:{@deviceId}",
+                                      "attributes": { "energy": { "column": "e" }, "name": { "column": "@deviceName" } } } ] },
+        "cs/app-2/0004a30b001c0001": { "channelDirection": "both", "idEncoding": "percent",
+                                       "entities": [ { "type": "Lamp", "id": "urn:ngsi-ld:Lamp:{@deviceId}",
+                                                       "attributes": { "on": { "column": "digital_out_1" } } } ] }
+      }
+    }
+  }
+}
+EOF
+brokerStart
+
+--RUN--
+B="http://localhost:$IOTALORA_PORT/ngsi-ld/v1"
+NS="$REPO_ROOT/test/funcTests/netserver.py"
+
+ttnUp() {  # ttnUp <app> <device> <uplink_message members> - an uplink, as TTN v3 publishes it
+  python3 "$NS" pub 11886 "v3/$1/devices/$2/up" "{\"end_device_ids\": {\"device_id\": \"$2\", \"dev_eui\": \"70B3D57ED005A1B2\"},
+    \"received_at\": \"2026-10-20T21:00:01Z\", \"uplink_message\": { $3 }}"
+}
+csUp() {  # csUp <app> <devEui> <deviceName> <members> - an uplink, as ChirpStack v4 publishes it
+  python3 "$NS" pub 11886 "application/$1/device/$2/event/up" "{\"deduplicationId\": \"d1\", \"time\": \"2026-10-20T21:30:00.000+00:00\",
+    \"deviceInfo\": {\"tenantId\": \"t1\", \"applicationId\": \"$1\", \"deviceName\": \"$3\", \"devEui\": \"$2\"}, $4}"
+}
+entity() {  # entity <id>
+  curl -s "$B/entities/$1"
+  echo
+}
+await() {  # await <id> <text> - until the entity's body has the text (5 s)
+  local i
+  for i in $(seq 1 50); do curl -s "$B/entities/$1" | grep -q -- "$2" && return 0; sleep 0.1; done
+  echo "await: $1 never had $2"
+}
+patch() {  # patch <id> <attr> <value> - the status
+  curl -s -o /dev/null -w "PATCH $2: %{http_code}\n" -X PATCH "$B/entities/$1/attrs/$2" -H 'Content-Type: application/json' -d "{\"value\": $3}"
+}
+downlinks() {  # downlinks <n> - the downlinks, once there are n (5 s); the log emptied
+  local i
+  for i in $(seq 1 50); do [ "$(grep -vc READY "$IOTALORA_TEST_DIR/downlinks.log")" -ge "$1" ] && break; sleep 0.1; done
+  grep -v READY "$IOTALORA_TEST_DIR/downlinks.log"
+  : > "$IOTALORA_TEST_DIR/downlinks.log"
+}
+
+echo "01. TTN, Cayenne LPP - temperature 21.5, humidity 55, a GPS point, digital_out 0, analog_out 1.00; received_at its observedAt"
+echo "==========================================================================================================================="
+LPP=$(python3 "$NS" b64 016700d702686e0388062ac8ff6f5200fde804010005030064)
+ttnUp farm@ttn node-1 "\"f_port\": 1, \"frm_payload\": \"$LPP\", \"received_at\": \"2026-10-20T21:00:00.250Z\""
+await urn:ngsi-ld:Sensor:node-1 '"level"'
+entity urn:ngsi-ld:Sensor:node-1
+echo
+echo
+
+
+echo "02. An LPP frame with a type that is not known - dropped whole: the temperature stays 21.5"
+echo "=========================================================================================="
+LPP=$(python3 "$NS" b64 016700e109c800)
+ttnUp farm@ttn node-1 "\"f_port\": 1, \"frm_payload\": \"$LPP\""
+sleep 0.5
+curl -s "$B/entities/urn:ngsi-ld:Sensor:node-1?pick=temperature" | grep '"value"'
+echo
+echo
+
+
+echo "03. TTN, decoded by the network server (application_server) - valve.open, flow"
+echo "==============================================================================="
+ttnUp decoded@ttn valve-1 '"f_port": 2, "frm_payload": "AQ==", "decoded_payload": {"valve": {"open": true}, "flow": 3.5}'
+await urn:ngsi-ld:Valve:valve-1 '"flow"'
+entity urn:ngsi-ld:Valve:valve-1
+echo
+echo
+
+
+echo "04. ChirpStack, CBOR - e 12.5; the device's name (@deviceName); the uplink's time its observedAt"
+echo "================================================================================================"
+CBOR=$(python3 "$NS" cbor '{"e": 12.5, "n": 3}')
+csUp app-1 0004a30b001c0002 meter-a "\"fPort\": 5, \"data\": \"$CBOR\""
+await urn:ngsi-ld:Meter:0004a30b001c0002 '"energy"'
+entity urn:ngsi-ld:Meter:0004a30b001c0002
+echo
+echo
+
+
+echo "05. Write-back, LPP - relay 1, level 12.5: two TTN downlinks, LPP digital_out (BAEB) and analog_out (BQME4g==)"
+echo "=============================================================================================================="
+patch urn:ngsi-ld:Sensor:node-1 relay 1
+patch urn:ngsi-ld:Sensor:node-1 level 12.5
+downlinks 2
+curl -s "$B/entities/urn:ngsi-ld:Sensor:node-1?pick=relay,level" | grep '"value"'
+echo
+echo
+
+
+echo "06. Write-back, decoded - open false: the downlink's decoded_payload { valve: { open: false } }, on fPort 2"
+echo "=========================================================================================================="
+patch urn:ngsi-ld:Valve:valve-1 open false
+downlinks 1
+echo
+echo
+
+
+echo "07. ChirpStack, one device - its uplink, then on 1: command/down with its DevEUI"
+echo "================================================================================"
+LPP=$(python3 "$NS" b64 010100)
+csUp app-2 0004a30b001c0001 lamp-a "\"fPort\": 1, \"data\": \"$LPP\""
+await urn:ngsi-ld:Lamp:0004a30b001c0001 '"on"'
+patch urn:ngsi-ld:Lamp:0004a30b001c0001 on 1
+downlinks 1
+echo
+echo
+
+
+echo "08. A write LPP cannot carry - the temperature (a sensor's): 400, nothing stored, no downlink"
+echo "============================================================================================="
+patch urn:ngsi-ld:Sensor:node-1 temperature 30
+sleep 0.5
+curl -s "$B/entities/urn:ngsi-ld:Sensor:node-1?pick=temperature" | grep '"value"'
+downlinks 0
+echo
+echo
+
+
+echo "09. The DataChannels - the writes out"
+echo "====================================="
+curl -s "$B/dataChannels" | python3 -c "
+import json, sys
+for d in sorted(json.load(sys.stdin), key=lambda d: d['channelTarget']):
+    print(d['channelTarget'], d.get('channelDirection', '-'), 'recordsIn', d['recordsIn'], 'recordsOut', d.get('recordsOut', '-'))"
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+for f in listen mosquitto; do
+  [ -f "$IOTALORA_TEST_DIR/$f.pid" ] || continue
+  pid=$(cat "$IOTALORA_TEST_DIR/$f.pid")
+  kill "$pid" 2>/dev/null
+  for i in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+done
+true
+
+
+--EXPECT--
+01. TTN, Cayenne LPP - temperature 21.5, humidity 55, a GPS point, digital_out 0, analog_out 1.00; received_at its observedAt
+===========================================================================================================================
+{
+  "id": "urn:ngsi-ld:Sensor:node-1",
+  "type": "Sensor",
+  "temperature": {
+    "type": "Property",
+    "value": 21.5,
+    "observedAt": "2026-10-20T21:00:00.25Z"
+  },
+  "humidity": {
+    "type": "Property",
+    "value": 55,
+    "observedAt": "2026-10-20T21:00:00.25Z"
+  },
+  "location": {
+    "type": "GeoProperty",
+    "value": {
+      "type": "Point",
+      "coordinates": [
+        -3.7038,
+        40.4168
+      ]
+    },
+    "observedAt": "2026-10-20T21:00:00.25Z"
+  },
+  "relay": {
+    "type": "Property",
+    "value": 0,
+    "observedAt": "2026-10-20T21:00:00.25Z"
+  },
+  "level": {
+    "type": "Property",
+    "value": 1,
+    "observedAt": "2026-10-20T21:00:00.25Z"
+  }
+}
+
+
+
+02. An LPP frame with a type that is not known - dropped whole: the temperature stays 21.5
+==========================================================================================
+    "value": 21.5,
+
+
+03. TTN, decoded by the network server (application_server) - valve.open, flow
+===============================================================================
+{
+  "id": "urn:ngsi-ld:Valve:valve-1",
+  "type": "Valve",
+  "open": {
+    "type": "Property",
+    "value": true,
+    "observedAt": "2026-10-20T21:00:01Z"
+  },
+  "flow": {
+    "type": "Property",
+    "value": 3.5,
+    "observedAt": "2026-10-20T21:00:01Z"
+  }
+}
+
+
+
+04. ChirpStack, CBOR - e 12.5; the device's name (@deviceName); the uplink's time its observedAt
+================================================================================================
+{
+  "id": "urn:ngsi-ld:Meter:0004a30b001c0002",
+  "type": "Meter",
+  "energy": {
+    "type": "Property",
+    "value": 12.5,
+    "observedAt": "2026-10-20T21:30:00Z"
+  },
+  "name": {
+    "type": "Property",
+    "value": "meter-a",
+    "observedAt": "2026-10-20T21:30:00Z"
+  }
+}
+
+
+
+05. Write-back, LPP - relay 1, level 12.5: two TTN downlinks, LPP digital_out (BAEB) and analog_out (BQME4g==)
+==============================================================================================================
+PATCH relay: 204
+PATCH level: 204
+v3/farm@ttn/devices/node-1/down/push {"downlinks":[{"f_port":1,"frm_payload":"BAEB","priority":"NORMAL"}]}
+v3/farm@ttn/devices/node-1/down/push {"downlinks":[{"f_port":1,"frm_payload":"BQME4g==","priority":"NORMAL"}]}
+    "value": 1,
+    "value": 12.5,
+
+
+06. Write-back, decoded - open false: the downlink's decoded_payload { valve: { open: false } }, on fPort 2
+==========================================================================================================
+PATCH open: 204
+v3/decoded@ttn/devices/valve-1/down/push {"downlinks":[{"f_port":2,"decoded_payload":{"valve":{"open":false}},"priority":"NORMAL"}]}
+
+
+07. ChirpStack, one device - its uplink, then on 1: command/down with its DevEUI
+================================================================================
+PATCH on: 204
+application/app-2/device/0004a30b001c0001/command/down {"devEui":"0004a30b001c0001","confirmed":false,"fPort":1,"data":"AQEB"}
+
+
+08. A write LPP cannot carry - the temperature (a sensor's): 400, nothing stored, no downlink
+=============================================================================================
+PATCH temperature: 400
+    "value": 21.5,
+
+
+09. The DataChannels - the writes out
+=====================================
+cs/app-1 - recordsIn 1 recordsOut -
+cs/app-2/0004a30b001c0001 both recordsIn 1 recordsOut 1
+ttn/decoded@ttn both recordsIn 1 recordsOut 1
+ttn/farm@ttn both recordsIn 1 recordsOut 2
+
+
